@@ -1,5 +1,5 @@
 use crate::raw::utils::MapGuard;
-use crate::raw::{self, InsertResult};
+use crate::raw::{self, InsertResult, RawInsertResultKV};
 use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
@@ -434,6 +434,40 @@ where
         }
     }
 
+    /// Get or insert a value into the set.
+    ///
+    /// If the set did not have this key present, insert it, `true` is returned.
+    ///
+    /// If the set did have this key present, `false` is returned and the old
+    /// value is not updated. This matters for types that can be `==` without
+    /// being identical. See the [standard library documentation] for details.
+    ///
+    /// [standard library documentation]: https://doc.rust-lang.org/std/collections/index.html#insert-and-complex-keys
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashSet;
+    ///
+    /// let set = HashSet::new();
+    /// assert_eq!(set.pin().get_or_insert(37), (&37, true));
+    /// assert_eq!(set.pin().is_empty(), false);
+    ///
+    /// assert_eq!(set.pin().get_or_insert(37), (&37, false));
+    /// assert_eq!(set.pin().get(&37), Some(&37));
+    /// ```
+    #[inline]
+    pub fn get_or_insert(&self, key: K, guard: &impl Guard) -> (&K, bool) {
+        match self.raw.insert_kv(key, (), false, self.raw.verify(guard)) {
+            RawInsertResultKV::Inserted(entry) => (unsafe { &(*entry).key }, true),
+            RawInsertResultKV::Error {
+                current,
+                not_inserted: _,
+            } => (unsafe { &(*current).key }, false),
+            RawInsertResultKV::Replaced(_) => unreachable!(),
+        }
+    }
+
     /// Removes a key from the set, returning the value at the key if the key
     /// was previously in the set.
     ///
@@ -777,6 +811,21 @@ where
             InsertResult::Inserted(_) => true,
             InsertResult::Replaced(_) => false,
             InsertResult::Error { .. } => unreachable!(),
+        }
+    }
+
+    /// Inserts a key-value pair into the set.
+    ///
+    /// See [`HashSet::get_or_insert`] for details.
+    #[inline]
+    pub fn get_or_insert(&self, key: K) -> (&K, bool) {
+        match self.set.raw.insert_kv(key, (), false, &self.guard) {
+            RawInsertResultKV::Inserted(entry) => (unsafe { &(*entry).key }, true),
+            RawInsertResultKV::Error {
+                current,
+                not_inserted: _,
+            } => (unsafe { &(*current).key }, false),
+            RawInsertResultKV::Replaced(_) => unreachable!(),
         }
     }
 

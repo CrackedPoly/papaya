@@ -11,7 +11,7 @@ use std::{hint, panic, ptr};
 
 use self::alloc::{RawTable, Table};
 use self::probe::Probe;
-use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, StrictProvenance, Tagged};
+use self::utils::{untagged, Counter, Parker, StrictProvenance, Tagged};
 use crate::map::{Compute, Operation, ResizeMode};
 use crate::Equivalent;
 
@@ -101,6 +101,22 @@ pub enum InsertResult<'g, V> {
 
     /// Error returned by `try_insert`.
     Error { current: &'g V, not_inserted: V },
+}
+
+// The raw result of an insert operation including both K and V.
+pub enum RawInsertResultKV<'g, K, V> {
+    /// Inserted the given value.
+    Inserted(*mut Entry<K, V>),
+
+    /// Replaced the given value.
+    #[allow(dead_code)]
+    Replaced(&'g V),
+
+    /// Error returned by `try_insert`.
+    Error {
+        current: *mut Entry<K, V>,
+        not_inserted: *mut Entry<K, V>,
+    },
 }
 
 // The raw result of an insert operation.
@@ -434,6 +450,39 @@ where
         result
     }
 
+    /// Inserts a key-value pair into the table.
+    #[inline]
+    pub fn insert_kv<'g>(
+        &self,
+        key: K,
+        value: V,
+        replace: bool,
+        guard: &'g impl VerifiedGuard,
+    ) -> RawInsertResultKV<'g, K, V> {
+        // Perform the insert.
+        let raw_result = self.insert_inner_kv(key, value, replace, guard);
+
+        match raw_result {
+            // Inserted a new entry.
+            RawInsertResultKV::Inserted(_) => {
+                // Increment the table length.
+                self.count.get(guard).fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Failed to insert the entry.
+            RawInsertResultKV::Error {
+                current: _,
+                not_inserted,
+            } => {
+                // Safety: We allocated this box above and it was not inserted into the table.
+                let _ = unsafe { Box::from_raw(not_inserted) };
+            }
+            _ => {}
+        };
+
+        raw_result
+    }
+
     /// Inserts an entry into the map.
     #[inline]
     fn insert_inner<'g>(
@@ -558,6 +607,152 @@ where
                         // before replacing it.
                         let value = unsafe { &(*entry.ptr).value };
                         return RawInsertResult::Replaced(value);
+                    }
+
+                    // The entry is being copied.
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe Some(probe.i),
+
+                    // The entry was deleted before we could update it, continue probing.
+                    UpdateStatus::Found(EntryStatus::Null) => {
+                        probe.next(table.mask);
+                        continue 'probe;
+                    }
+
+                    UpdateStatus::Found(EntryStatus::Value(_)) => {}
+                }
+            };
+
+            // Prepare to retry in the next table.
+            table = self.prepare_retry_insert(copying, &mut help_copy, table, guard);
+        }
+    }
+
+    /// Inserts an entry into the map.
+    #[inline]
+    fn insert_inner_kv<'g>(
+        &self,
+        key: K,
+        value: V,
+        should_replace: bool,
+        guard: &'g impl VerifiedGuard,
+    ) -> RawInsertResultKV<'g, K, V> {
+        // Allocate the entry to be inserted.
+        let new_entry = untagged(Box::into_raw(Box::new(Entry { key, value })));
+
+        // Safety: We just allocated the entry above.
+        let new_ref = unsafe { &(*new_entry.ptr) };
+
+        // Load the root table.
+        let mut table = self.root(guard);
+
+        // Allocate the table if it has not been initialized yet.
+        if table.raw.is_null() {
+            table = self.init(None);
+        }
+
+        let (h1, h2) = self.hash(&new_ref.key);
+
+        let mut help_copy = true;
+        loop {
+            // Initialize the probe state.
+            let mut probe = Probe::start(h1, table.mask);
+
+            // Probe until we reach the limit.
+            let copying = 'probe: loop {
+                if probe.len > table.limit {
+                    break None;
+                }
+
+                // Load the entry metadata first for cheap searches.
+                //
+                // Safety: `probe.i` is always in-bounds for the table length.
+                let meta = unsafe { table.meta(probe.i) }.load(Ordering::Acquire);
+
+                // The entry is empty, try to insert.
+                let entry = if meta == meta::EMPTY {
+                    // Perform the insertion.
+                    //
+                    // Safety: `probe.i` is always in-bounds for the table length. Additionally,
+                    // `new_entry` was allocated above and never shared.
+                    match unsafe { self.insert_at(probe.i, h2, new_entry.raw, table, guard) } {
+                        // Successfully inserted.
+                        InsertStatus::Inserted => {
+                            return RawInsertResultKV::Inserted(new_entry.ptr)
+                        }
+
+                        // Lost to a concurrent insert.
+                        //
+                        // If the key matches, we might be able to update the value.
+                        InsertStatus::Found(EntryStatus::Value(found))
+                        | InsertStatus::Found(EntryStatus::Copied(found)) => found,
+
+                        // Otherwise, continue probing.
+                        InsertStatus::Found(EntryStatus::Null) => {
+                            probe.next(table.mask);
+                            continue 'probe;
+                        }
+                    }
+                }
+                // Found a potential match.
+                else if meta == h2 {
+                    // Load the full entry.
+                    //
+                    // Safety: `probe.i` is always in-bounds for the table length.
+                    let entry = guard
+                        .protect(unsafe { table.entry(probe.i) }, Ordering::Acquire)
+                        .unpack();
+
+                    // The entry was deleted, keep probing.
+                    if entry.ptr.is_null() {
+                        probe.next(table.mask);
+                        continue 'probe;
+                    }
+
+                    // If the key matches, we might be able to update the value.
+                    entry
+                }
+                // Otherwise, continue probing.
+                else {
+                    probe.next(table.mask);
+                    continue 'probe;
+                };
+
+                // Safety: We performed a protected load of the pointer using a verified guard with
+                // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                // as we hold the guard.
+                let entry_ref = unsafe { &(*entry.ptr) };
+
+                // Check for a full match.
+                if entry_ref.key != new_ref.key {
+                    probe.next(table.mask);
+                    continue 'probe;
+                }
+
+                // The entry is being copied to the new table.
+                if entry.tag() & Entry::COPYING != 0 {
+                    break 'probe Some(probe.i);
+                }
+
+                // Return an error for calls to `try_insert`.
+                if !should_replace {
+                    return RawInsertResultKV::Error {
+                        current: entry.ptr,
+                        not_inserted: new_entry.ptr,
+                    };
+                }
+
+                // Try to update the value.
+                //
+                // Safety:
+                // - `probe.i` is always in-bounds for the table length
+                // - `entry` is a valid non-null entry that was inserted into the map.
+                match unsafe { self.insert_slow(probe.i, entry, new_entry.raw, table, guard) } {
+                    // Successfully performed the update.
+                    UpdateStatus::Replaced(entry) => {
+                        // Safety: `entry` is a valid non-null entry that we found in the map
+                        // before replacing it.
+                        let value = unsafe { &(*entry.ptr).value };
+                        return RawInsertResultKV::Replaced(value);
                     }
 
                     // The entry is being copied.

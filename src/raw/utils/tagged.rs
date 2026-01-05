@@ -93,6 +93,7 @@ impl<T> Clone for Tagged<T> {
 }
 
 // Polyfill for the unstable `atomic_ptr_strict_provenance` APIs.
+#[allow(dead_code)]
 pub trait AtomicPtrFetchOps<T> {
     fn fetch_or(&self, value: usize, ordering: Ordering) -> *mut T;
 }
